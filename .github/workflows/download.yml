@@ -1,0 +1,219 @@
+name: Advanced Download Manager
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      manual_url:
+        description: 'Manual download URL'
+        required: false
+        type: string
+      manual_mode:
+        description: 'Download mode'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - zip
+
+jobs:
+  smart-download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 2
+
+      - name: Setup tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl wget aria2 zip unzip jq parallel
+
+      - name: Smart extract URLs
+        id: extract
+        run: |
+          cd $GITHUB_WORKSPACE
+          
+          # حالت Manual از workflow_dispatch
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.manual_url }}" ]; then
+            URL_RAW="${{ inputs.manual_url }}"
+            MODE="${{ inputs.manual_mode }}"
+            echo "✅ Manual mode: $MODE"
+            echo "✅ Manual URL: $URL_RAW"
+          else
+            # حالت خودکار از commit message
+            MSG=$(git log -1 --pretty=%B | head -n1)
+            
+            if echo "$MSG" | grep -qi "download-zip:"; then
+              MODE="zip"
+              URL_RAW=$(echo "$MSG" | sed -n 's/.*download-zip:[[:space:]]*//p')
+              echo "✅ Detected download-zip mode"
+            elif echo "$MSG" | grep -qi "download:"; then
+              MODE="normal"
+              URL_RAW=$(echo "$MSG" | sed -n 's/.*download:[[:space:]]*//p')
+              echo "✅ Detected download mode"
+            elif echo "$MSG" | grep -qE 'https?://github.com/[^[:space:]]+/releases/download/[^[:space:]]+'; then
+              MODE="normal"
+              URL_RAW=$(echo "$MSG" | grep -oE 'https?://github.com/[^[:space:]]+/releases/download/[^[:space:]]+')
+              echo "✅ Auto-detected GitHub release URL"
+            else
+              echo "❌ No valid download command found in commit message"
+              exit 1
+            fi
+          fi
+          
+          # بررسی و استخراج URL‌ها
+          echo "📝 Mode: $MODE"
+          echo "📝 Raw input: $URL_RAW"
+          
+          URLS=$(echo "$URL_RAW" | grep -oE 'https?://[^[:space:]]+' | sort -u || true)
+          
+          if [ -z "$URLS" ]; then
+            echo "❌ No valid URLs found in: $URL_RAW"
+            exit 1
+          fi
+          
+          echo "urls=$URLS" >> $GITHUB_OUTPUT
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          
+          echo "✅ Found URLs:"
+          echo "$URLS" | while read url; do
+            echo "  - $url"
+          done
+
+      - name: Optimized download with curl
+        run: |
+          mkdir -p downloads temp_dl
+          
+          URLS="${{ steps.extract.outputs.urls }}"
+          
+          if [ -z "$URLS" ]; then
+            echo "❌ No URLs to download"
+            exit 1
+          fi
+          
+          # دانلود تک تک فایل‌ها
+          echo "$URLS" | while read url; do
+            if [ -n "$url" ]; then
+              filename=$(basename "$url" | cut -d '?' -f1 | cut -d '#' -f1)
+              [ -z "$filename" ] && filename="file_$(date +%s)_${RANDOM}"
+              
+              echo "⬇️  Downloading: $url"
+              if curl -L --fail --max-time 300 -o "temp_dl/$filename" "$url"; then
+                size=$(stat -c%s "temp_dl/$filename")
+                echo "✅ Downloaded: $filename ($size bytes)"
+              else
+                echo "❌ Failed: $url"
+                exit 1
+              fi
+            fi
+          done
+          
+          # شمارش نهایی
+          FINAL_COUNT=$(ls -1 temp_dl/ 2>/dev/null | wc -l)
+          echo "download_count=$FINAL_COUNT" >> $GITHUB_ENV
+          
+          if [ $FINAL_COUNT -eq 0 ]; then
+            echo "❌ No files downloaded"
+            exit 1
+          fi
+          
+          echo "✅ Successfully downloaded $FINAL_COUNT file(s)"
+
+      - name: Smart file organization
+        run: |
+          MODE="${{ steps.extract.outputs.mode }}"
+          
+          if [ "$MODE" = "zip" ]; then
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            ZIP_NAME="archive_${TIMESTAMP}.zip"
+            
+            echo "📦 Creating archive: $ZIP_NAME"
+            cd temp_dl
+            zip -r "../downloads/$ZIP_NAME" ./*
+            cd ..
+            echo "✅ Archive created: $ZIP_NAME"
+          else
+            # سازماندهی بر اساس نوع فایل
+            for file in temp_dl/*; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                
+                case "$filename" in
+                  *.apk) dest="downloads/apk_files/" ;;
+                  *.zip|*.tar|*.gz|*.xz) dest="downloads/archives/" ;;
+                  *.pdf|*.doc|*.docx) dest="downloads/documents/" ;;
+                  *.jpg|*.jpeg|*.png|*.gif|*.webp) dest="downloads/images/" ;;
+                  *.mp4|*.mkv|*.avi|*.mov) dest="downloads/videos/" ;;
+                  *.mp3|*.wav|*.flac|*.ogg) dest="downloads/audios/" ;;
+                  *.exe|*.msi|*.deb|*.rpm) dest="downloads/installers/" ;;
+                  *) dest="downloads/others/" ;;
+                esac
+                
+                mkdir -p "$dest"
+                mv "$file" "$dest"
+                echo "📁 Organized: $filename -> $dest"
+              fi
+            done
+          fi
+          
+          # حذف فایل‌های موقت
+          rm -rf temp_dl
+
+      - name: Generate report
+        run: |
+          echo "## ✅ Download Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Mode | ${{ steps.extract.outputs.mode }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Files | ${{ env.download_count }} |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -d "downloads" ]; then
+            TOTAL_SIZE=$(du -sh downloads/ | cut -f1)
+            echo "| Total Size | $TOTAL_SIZE |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📂 Downloaded files:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            find downloads -type f | head -20 | while read file; do
+              size=$(du -h "$file" | cut -f1)
+              echo "- \`$file\` ($size)" >> $GITHUB_STEP_SUMMARY
+            done
+          fi
+
+      - name: Commit and push
+        if: success() && env.download_count != '0'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add downloads/
+          
+          if git diff --cached --quiet; then
+            echo "📝 No changes to commit"
+          else
+            git commit -m "Add ${{ env.download_count }} downloaded file(s) [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ Successfully committed and pushed ${{ env.download_count }} file(s)"
+          fi
+
+      - name: Error handler
+        if: failure()
+        run: |
+          echo "## ❌ Download Failed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Possible issues:" >> $GITHUB_STEP_SUMMARY
+          echo "- URL is invalid or inaccessible" >> $GITHUB_STEP_SUMMARY
+          echo "- Network timeout" >> $GITHUB_STEP_SUMMARY
+          echo "- File does not exist" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Please check the URL and try again." >> $GITHUB_STEP_SUMMARY
